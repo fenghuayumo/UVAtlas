@@ -13,6 +13,7 @@
 #include "isochartmesh.h"
 #include "isochart.h"
 #include "sparsematrix.hpp"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 using namespace DirectX;
@@ -285,6 +286,7 @@ HRESULT CIsochartMesh::CheckLinearEquationParamResult(
     bool &bIsOverLap)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::LSCMParameterization", m_dwFaceNumber);
 
     double fTotal2D = 0;
     for (size_t ii = 0; ii < m_dwFaceNumber; ii++)

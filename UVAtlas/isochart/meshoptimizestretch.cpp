@@ -42,6 +42,10 @@
 #include "isochartmesh.h"
 #include "UVAtlas.h"
 #include "maxheap.hpp"
+#include "uvatlas_timing.h"
+
+#include <atomic>
+#include <thread>
 
 using namespace Isochart;
 using namespace DirectX;
@@ -243,12 +247,55 @@ HRESULT CIsochartMesh::OptimizeAllL2SquaredStretch(
     ISOCHARTMESH_ARRAY &chartList,
     bool bOptimizeSignal)
 {
-    HRESULT hr = S_OK;
-    for (size_t ii = 0; ii < chartList.size(); ii++)
+    UVATLAS_TIME_SCOPE("Charts::OptimizeAllL2SquaredStretch");
+    if (chartList.empty())
     {
-        FAILURE_RETURN(chartList[ii]->OptimizeChartL2Stretch(bOptimizeSignal));
+        return S_OK;
     }
-    return S_OK;
+
+    const size_t workerCount = chartList[0]->m_IsochartEngine.WorkerCount();
+    if (workerCount <= 1 || chartList.size() <= 1)
+    {
+        HRESULT hr = S_OK;
+        for (size_t ii = 0; ii < chartList.size(); ii++)
+        {
+            FAILURE_RETURN(chartList[ii]->OptimizeChartL2Stretch(bOptimizeSignal));
+        }
+        return hr;
+    }
+
+    std::atomic<HRESULT> hrOut{ S_OK };
+    std::atomic<size_t> next{ 0 };
+    const size_t workers = chartList.size() < workerCount ? chartList.size() : workerCount;
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (size_t w = 0; w < workers; ++w)
+    {
+        threads.emplace_back([&]() {
+            for (;;)
+            {
+                if (FAILED(hrOut.load(std::memory_order_relaxed)))
+                {
+                    return;
+                }
+                const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= chartList.size())
+                {
+                    return;
+                }
+                const HRESULT hr = chartList[index]->OptimizeChartL2Stretch(bOptimizeSignal);
+                if (FAILED(hr))
+                {
+                    hrOut.store(hr, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread &thread : threads)
+    {
+        thread.join();
+    }
+    return hrOut.load(std::memory_order_relaxed);
 }
 
 float CIsochartMesh::ComputeGeoAvgL2Stretch(
@@ -1794,9 +1841,8 @@ bool CIsochartMesh::OptimizeVertexStretchAroundCenter(
     float fTempStretch = 0;
     XMFLOAT2 middle;
     // As the decription in [SSGH01], randomly moving vertex will have more
-    // chance to find the optimal position. To make consistent results, srand
-    // with a specified value 2
-    srand(2);
+    // chance to find the optimal position. The engine RNG is shared by charts
+    // that the work queue optimizes at the same time, so it is locked there.
     size_t iteration = 0;
     while (iteration < optimizeInfo.dwRandOptOneVertTimes)
     {

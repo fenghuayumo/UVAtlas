@@ -247,6 +247,12 @@ namespace DirectX
         _In_ std::function<HRESULT __cdecl(float percentComplete)> statusCallBack,
         _In_ float callbackFrequency);
 
+    // Thread-local cap on how many independent charts one UVAtlasCreate or
+    // UVAtlasPartition call processes at once. Read when that call initializes
+    // its engine. 0 and 1 keep the chart queue serial. The calling thread must
+    // set this before Create/Partition; worker threads do not inherit it.
+    UVATLAS_API void __cdecl UVAtlasSetEngineWorkerCount(uint32_t workerCount) noexcept;
+
     //============================================================================
     //
     // IMT Calculation apis

@@ -11,11 +11,32 @@
 #include "UVAtlas.h"
 #include "isochart.h"
 #include "UVAtlasRepacker.h"
+#include "uvatlas_workers.h"
 
 #include <cstdarg>
 
 using namespace Isochart;
 using namespace DirectX;
+
+namespace DirectX
+{
+    static thread_local uint32_t g_uvatlasEngineWorkerCount = 1;
+
+    uint32_t UVAtlasEngineWorkerCount() noexcept
+    {
+        return g_uvatlasEngineWorkerCount;
+    }
+
+    void UVAtlasEngineWorkerCountStore(uint32_t workerCount) noexcept
+    {
+        g_uvatlasEngineWorkerCount = workerCount == 0 ? 1u : workerCount;
+    }
+}
+
+void __cdecl DirectX::UVAtlasSetEngineWorkerCount(uint32_t workerCount) noexcept
+{
+    DirectX::UVAtlasEngineWorkerCountStore(workerCount);
+}
 
 namespace
 {

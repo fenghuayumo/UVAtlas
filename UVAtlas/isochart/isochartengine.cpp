@@ -11,6 +11,15 @@
 #include "isochartengine.h"
 #include "isochart.h"
 #include "isochartmesh.h"
+#include "uvatlas_timing.h"
+#include "uvatlas_workers.h"
+
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <utility>
 
 using namespace DirectX;
 using namespace Isochart;
@@ -40,7 +49,8 @@ m_state(ISOCHART_ST_UNINITILAIZED),
 #ifdef _WIN32
 m_hMutex(nullptr),
 #endif
-m_dwOptions(ISOCHARTOPTION::DEFAULT)
+m_dwOptions(ISOCHARTOPTION::DEFAULT),
+m_dwWorkerCount(1)
 {
     std::random_device randomDevice;
     m_randomEngine.seed(randomDevice());
@@ -101,6 +111,7 @@ HRESULT CIsochartEngine::Initialize(
     unsigned int dwOptions) noexcept
 {
     DPF(1, "Initialize...");
+    UVATLAS_TIME_SCOPE_WORK("Engine::Initialize", VertexCount);
 
     // 1. Check arguments and current state
     if (!CheckInitializeParameters(
@@ -281,100 +292,256 @@ HRESULT CIsochartEngine::InitializeCurrentChartHeap()
     return S_OK;
 }
 
-#ifdef _OPENMP
-#ifdef _MSC_VER
-#pragma warning(disable : 6993)
-#endif
-HRESULT CIsochartEngine::ParameterizeChartsInHeapParallelized(
+namespace
+{
+    template <typename WorkFn>
+    HRESULT DrainChartQueue(
+        std::vector<CIsochartMesh *> pending,
+        std::vector<CIsochartMesh *> &done,
+        size_t workerCount,
+        bool updateCallback,
+        CCallbackSchemer &callback,
+        WorkFn work)
+    {
+        if (pending.empty())
+        {
+            return S_OK;
+        }
+
+        if (workerCount < 1)
+        {
+            workerCount = 1;
+        }
+        if (workerCount > 64)
+        {
+            workerCount = 64;
+        }
+
+        struct Shared
+        {
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::deque<CIsochartMesh *> pending;
+            size_t inflight = 0;
+            bool stop = false;
+            HRESULT hr = S_OK;
+        } shared;
+
+        for (CIsochartMesh *chart : pending)
+        {
+            shared.pending.push_back(chart);
+        }
+
+        auto worker = [&]()
+        {
+            for (;;)
+            {
+                CIsochartMesh *chart = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(shared.mutex);
+                    shared.cv.wait(lock, [&] {
+                        return shared.stop || !shared.pending.empty() || shared.inflight == 0;
+                    });
+                    if (shared.stop || FAILED(shared.hr))
+                    {
+                        return;
+                    }
+                    if (shared.pending.empty())
+                    {
+                        return;
+                    }
+                    chart = shared.pending.front();
+                    shared.pending.pop_front();
+                    ++shared.inflight;
+                }
+
+                HRESULT hr = S_OK;
+                try
+                {
+                    hr = work(*chart);
+                }
+                catch (std::bad_alloc &)
+                {
+                    hr = E_OUTOFMEMORY;
+                }
+                catch (...)
+                {
+                    hr = E_FAIL;
+                }
+
+                size_t callbackFaces = 0;
+                bool fireCallback = false;
+                {
+                    std::lock_guard<std::mutex> lock(shared.mutex);
+                    --shared.inflight;
+                    if (FAILED(hr) || shared.stop || FAILED(shared.hr))
+                    {
+                        if (FAILED(hr) && SUCCEEDED(shared.hr))
+                        {
+                            shared.hr = hr;
+                        }
+                        shared.stop = true;
+                        if (chart && !chart->IsInitChart())
+                        {
+                            delete chart;
+                        }
+                        else if (chart)
+                        {
+                            try
+                            {
+                                done.push_back(chart);
+                            }
+                            catch (std::bad_alloc &)
+                            {
+                                shared.hr = E_OUTOFMEMORY;
+                            }
+                        }
+                        shared.cv.notify_all();
+                        return;
+                    }
+
+                    if (chart->HasChildren())
+                    {
+                        try
+                        {
+                            for (size_t i = 0; i < chart->GetChildrenCount(); ++i)
+                            {
+                                if (CIsochartMesh *child = chart->GetChild(i))
+                                {
+                                    shared.pending.push_back(child);
+                                }
+                            }
+                        }
+                        catch (std::bad_alloc &)
+                        {
+                            shared.hr = E_OUTOFMEMORY;
+                            shared.stop = true;
+                            shared.cv.notify_all();
+                            return;
+                        }
+                        chart->UnlinkAllChildren();
+                        if (!chart->IsInitChart())
+                        {
+                            delete chart;
+                        }
+                        shared.cv.notify_all();
+                    }
+                    else
+                    {
+                        try
+                        {
+                            done.push_back(chart);
+                        }
+                        catch (std::bad_alloc &)
+                        {
+                            shared.hr = E_OUTOFMEMORY;
+                            shared.stop = true;
+                            if (!chart->IsInitChart())
+                            {
+                                delete chart;
+                            }
+                            shared.cv.notify_all();
+                            return;
+                        }
+                        if (updateCallback)
+                        {
+                            callbackFaces = chart->GetFaceNumber();
+                            fireCallback = true;
+                        }
+                        shared.cv.notify_all();
+                    }
+                }
+
+                if (fireCallback && FAILED(callback.UpdateCallbackAdapt(callbackFaces)))
+                {
+                    std::lock_guard<std::mutex> lock(shared.mutex);
+                    if (SUCCEEDED(shared.hr))
+                    {
+                        shared.hr = E_FAIL;
+                    }
+                    shared.stop = true;
+                    shared.cv.notify_all();
+                    return;
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(workerCount);
+        for (size_t i = 0; i < workerCount; ++i)
+        {
+            threads.emplace_back(worker);
+        }
+        for (std::thread &thread : threads)
+        {
+            thread.join();
+        }
+
+        if (FAILED(shared.hr))
+        {
+            for (CIsochartMesh *chart : shared.pending)
+            {
+                if (!chart)
+                {
+                    continue;
+                }
+                if (!chart->IsInitChart())
+                {
+                    delete chart;
+                }
+                else
+                {
+                    done.push_back(chart);
+                }
+            }
+        }
+        return shared.hr;
+    }
+}
+
+void CIsochartEngine::CaptureWorkerCount() noexcept
+{
+    uint32_t workerCount = DirectX::UVAtlasEngineWorkerCount();
+    if (workerCount < 1)
+    {
+        workerCount = 1;
+    }
+    if (workerCount > 64)
+    {
+        workerCount = 64;
+    }
+    m_dwWorkerCount = workerCount;
+}
+
+HRESULT CIsochartEngine::ParameterizeChartsInHeap(
     bool bFirstTime,
     size_t MaxChartNumber)
 {
-    // 3.1 If Any charts needed to be partitioned
+    UVATLAS_TIME_SCOPE("Engine::ParameterizeCharts");
 
-    /// Parallelization:
-    /// 1st Move heap to vector `parent`
-    /// 2nd run through parent in parallel, add children to `children`
-    /// 3rd children = parent, goto 2nd
-    std::vector<CIsochartMesh *> parent;
+    std::vector<CIsochartMesh *> pending;
     while (!m_currentChartHeap.empty())
-        parent.emplace_back(m_currentChartHeap.cutTopData());
-
-    HRESULT hrOut = S_OK;
-    while (!parent.empty() && !FAILED(hrOut))
     {
-        std::vector<CIsochartMesh *> children;
-    #pragma omp parallel
-        {
-
-            std::vector<CIsochartMesh *> children_thrd;
-        #pragma omp for
-            for (int n = 0; n < static_cast<int>(parent.size()); ++n)
-            {
-                if (FAILED(hrOut)) // for the other threads
-                    continue;
-
-                auto pChart = parent[static_cast<size_t>(n)];
-                assert(pChart != nullptr);
-                _Analysis_assume_(pChart != nullptr);
-
-                // Process current chart, if it's needed to be partitioned again,
-                // Just partition it.
-                HRESULT hr = pChart->Partition(); /// Adds children to pChart->m_children						// hotspot
-                if (FAILED(hr))
-                {
-                    hrOut = hr; // doesn't need pragma atomic as all changes to hrOut are to set it to FAILED
-                    continue;
-                }
-
-                // If current chart has been partitoned, just children add to heap to be
-                // processed later.
-                if (pChart->HasChildren())
-                {
-                    /// Add children to children vector to be ran in the following parallelization run
-                    for (size_t i = 0; i < pChart->GetChildrenCount(); i++)
-                    {
-                        CIsochartMesh *pChild = pChart->GetChild(i);
-                        assert(pChild != nullptr);
-
-                        if (pChild->GetVertexNumber() == 4 && (pChild->GetVertexBuffer()[0]).dwIDInRootMesh == 228)
-                        {
-                            DPF(3, "hello...");
-                        }
-
-                        children_thrd.emplace_back(pChild);
-                    }
-                    pChart->UnlinkAllChildren();
-                    if (!pChart->IsInitChart())
-                        delete pChart;
-                }
-                else // A right parameterization (with acceptable face overturn) has been gotten, add current chart to final Chart List
-                {
-                    try
-                    {
-                    #pragma omp critical
-                        m_finalChartList.push_back(pChart);
-                    }
-                    catch (std::bad_alloc &)
-                    {
-                        hrOut = E_OUTOFMEMORY;
-                    }
-                }
-            }
-        #pragma omp critical
-            {
-                children.insert(children.end(), children_thrd.begin(), children_thrd.end());
-                // std::move(children_thrd.begin(), children_thrd.end(), std::back_inserter(children)); // Might be faster if the objects in vector have move constructor. Needs testing
-            }
-        }
-        parent = children;
+        pending.push_back(m_currentChartHeap.cutTopData());
     }
 
-    // 3.2 Update status
+    const HRESULT hr = DrainChartQueue(
+        std::move(pending),
+        m_finalChartList,
+        m_dwWorkerCount,
+        bFirstTime,
+        m_callbackSchemer,
+        [](CIsochartMesh &chart) { return chart.Partition(); });
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     if (bFirstTime)
     {
-        HRESULT hr = m_callbackSchemer.FinishWorkAdapt();
-        if (FAILED(hr))
-            return hr;
+        HRESULT callbackHr = m_callbackSchemer.FinishWorkAdapt();
+        if (FAILED(callbackHr))
+            return callbackHr;
 
         if (dwExpectChartCount > 0)
         {
@@ -394,48 +561,198 @@ HRESULT CIsochartEngine::ParameterizeChartsInHeapParallelized(
     return S_OK;
 }
 
-#else
 
-HRESULT CIsochartEngine::ParameterizeChartsInHeap(
-    bool bFirstTime,
-    size_t MaxChartNumber)
+HRESULT CIsochartEngine::GenerateNewChartsToParameterize()
 {
-    // 3.1 If Any charts needed to be partitioned
-    while (!m_currentChartHeap.empty())
-    {
-        DPF(1, "Processed charts number is : %zu", m_finalChartList.size() + m_currentChartHeap.size());
-        auto pChart = m_currentChartHeap.cutTopData();
-        assert(pChart != nullptr);
-        _Analysis_assume_(pChart != nullptr);
+    UVATLAS_TIME_SCOPE("Engine::GenerateNewCharts");
 
-        // Process current chart, if it's needed to be partitioned again,
-        // Just partition it.
-        HRESULT hr = pChart->Partition();
+    // IMT ranking rescales every chart as it searches, and a caller-supplied
+    // chart cap has to move one chart at a time so the count check still fires.
+    // Stretch-only runs split the worst charts together and parameterize the
+    // children on the work queue.
+    if (IsIMTSpecified() || m_dwWorkerCount <= 1 || dwExpectChartCount != 0)
+    {
+        CIsochartMesh *pChartWithMaxL2Stretch = nullptr;
+        uint32_t dwMaxIdx = 0;
+
+        if (IsIMTSpecified())
+        {
+            float fMaxStretch;
+            dwMaxIdx = CIsochartMesh::GetChartWidthLargestGeoAvgStretch(
+                m_finalChartList,
+                fMaxStretch);
+        }
+        else
+        {
+            dwMaxIdx =
+                CIsochartMesh::GetBestPartitionCanidate(m_finalChartList);
+        }
+        assert(INVALID_INDEX != dwMaxIdx);
+
+        pChartWithMaxL2Stretch = m_finalChartList[dwMaxIdx];
+        assert(pChartWithMaxL2Stretch != nullptr);
+
+        HRESULT hr = pChartWithMaxL2Stretch->Bipartition3D();
         if (FAILED(hr))
         {
             return hr;
         }
-
-        // If current chart has been partitoned, just children add to heap to be
-        // processed later.
-        if (pChart->HasChildren())
+        if (pChartWithMaxL2Stretch->HasChildren())
         {
-            if (FAILED(hr = AddChildrenToCurrentChartHeap(pChart)))
+            if (FAILED(hr = AddChildrenToCurrentChartHeap(pChartWithMaxL2Stretch)))
             {
-                delete pChart;
+                delete pChartWithMaxL2Stretch;
                 return hr;
             }
-            else
+            if (!pChartWithMaxL2Stretch->IsInitChart())
             {
-                if (!pChart->IsInitChart())
-                {
-                    delete pChart;
-                }
+                delete pChartWithMaxL2Stretch;
             }
         }
+        m_finalChartList.erase(m_finalChartList.begin() + ptrdiff_t(dwMaxIdx));
+        return S_OK;
+    }
 
-        // If A right parameterization (with acceptable face overturn)
-        // has been gotten, add current chart to final Chart List.
+    std::vector<std::pair<float, size_t>> ranked;
+    ranked.reserve(m_finalChartList.size());
+    for (size_t i = 0; i < m_finalChartList.size(); ++i)
+    {
+        CIsochartMesh *pChart = m_finalChartList[i];
+        if (pChart->GetFaceNumber() <= 1)
+        {
+            continue;
+        }
+        if (pChart->GetL2SquaredStretch() == pChart->GetBaseL2SquaredStretch())
+        {
+            continue;
+        }
+        ranked.emplace_back(pChart->GetL2SquaredStretch(), i);
+    }
+    if (ranked.empty())
+    {
+        for (size_t i = 0; i < m_finalChartList.size(); ++i)
+        {
+            if (m_finalChartList[i]->GetFaceNumber() > 1)
+            {
+                ranked.emplace_back(m_finalChartList[i]->GetL2SquaredStretch(), i);
+                break;
+            }
+        }
+    }
+    if (ranked.empty())
+    {
+        return S_OK;
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const std::pair<float, size_t> &a, const std::pair<float, size_t> &b) {
+        return a.first > b.first;
+    });
+    size_t batch = m_dwWorkerCount;
+    if (batch > ranked.size())
+    {
+        batch = ranked.size();
+    }
+
+    std::vector<char> selected(m_finalChartList.size(), 0);
+    for (size_t n = 0; n < batch; ++n)
+    {
+        selected[ranked[n].second] = 1;
+    }
+
+    std::vector<CIsochartMesh *> chosen;
+    std::vector<CIsochartMesh *> keep;
+    chosen.reserve(batch);
+    keep.reserve(m_finalChartList.size());
+    for (size_t i = 0; i < m_finalChartList.size(); ++i)
+    {
+        if (selected[i])
+        {
+            chosen.push_back(m_finalChartList[i]);
+        }
+        else
+        {
+            keep.push_back(m_finalChartList[i]);
+        }
+    }
+    m_finalChartList.swap(keep);
+
+    std::atomic<HRESULT> hrOut{ S_OK };
+    std::atomic<size_t> next{ 0 };
+    const size_t workers = chosen.size() < m_dwWorkerCount ? chosen.size() : m_dwWorkerCount;
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (size_t w = 0; w < workers; ++w)
+    {
+        threads.emplace_back([&]() {
+            for (;;)
+            {
+                if (FAILED(hrOut.load(std::memory_order_relaxed)))
+                {
+                    return;
+                }
+                const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= chosen.size())
+                {
+                    return;
+                }
+                const HRESULT bipartHr = chosen[index]->Bipartition3D();
+                if (FAILED(bipartHr))
+                {
+                    hrOut.store(bipartHr, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread &thread : threads)
+    {
+        thread.join();
+    }
+    if (FAILED(hrOut.load(std::memory_order_relaxed)))
+    {
+        // These charts were already taken off m_finalChartList. Put them back
+        // so the engine failure path still owns them and their children.
+        const HRESULT hrFail = hrOut.load(std::memory_order_relaxed);
+        for (CIsochartMesh *pChart : chosen)
+        {
+            try
+            {
+                m_finalChartList.push_back(pChart);
+            }
+            catch (std::bad_alloc &)
+            {
+                delete pChart;
+            }
+        }
+        return hrFail;
+    }
+
+    for (size_t chosenIndex = 0; chosenIndex < chosen.size(); ++chosenIndex)
+    {
+        CIsochartMesh *pChart = chosen[chosenIndex];
+        if (pChart->HasChildren())
+        {
+            const HRESULT hr = AddChildrenToCurrentChartHeap(pChart);
+            if (FAILED(hr))
+            {
+                delete pChart;
+                for (size_t rest = chosenIndex + 1; rest < chosen.size(); ++rest)
+                {
+                    try
+                    {
+                        m_finalChartList.push_back(chosen[rest]);
+                    }
+                    catch (std::bad_alloc &)
+                    {
+                        delete chosen[rest];
+                    }
+                }
+                return hr;
+            }
+            if (!pChart->IsInitChart())
+            {
+                delete pChart;
+            }
+        }
         else
         {
             try
@@ -445,90 +762,21 @@ HRESULT CIsochartEngine::ParameterizeChartsInHeap(
             catch (std::bad_alloc &)
             {
                 delete pChart;
+                for (size_t rest = chosenIndex + 1; rest < chosen.size(); ++rest)
+                {
+                    try
+                    {
+                        m_finalChartList.push_back(chosen[rest]);
+                    }
+                    catch (std::bad_alloc &)
+                    {
+                        delete chosen[rest];
+                    }
+                }
                 return E_OUTOFMEMORY;
             }
-
-            if (bFirstTime)
-            {
-                if (FAILED(hr = m_callbackSchemer.UpdateCallbackAdapt(pChart->GetFaceNumber())))
-                    return hr;
-            }
         }
     }
-
-    // 3.2 Update status
-    if (bFirstTime)
-    {
-        HRESULT hr = m_callbackSchemer.FinishWorkAdapt();
-        if (FAILED(hr))
-            return hr;
-
-        if (dwExpectChartCount > 0)
-        {
-            size_t dwStep = 0;
-            if (MaxChartNumber > m_currentChartHeap.size())
-            {
-                dwStep = MaxChartNumber - m_currentChartHeap.size();
-            }
-            m_callbackSchemer.InitCallBackAdapt(dwStep, 0.70f, 0.40f);
-        }
-        else
-        {
-            m_callbackSchemer.InitCallBackAdapt(1, 0.40f, 0.40f);
-        }
-    }
-
-    return S_OK;
-}
-#endif
-
-HRESULT CIsochartEngine::GenerateNewChartsToParameterize()
-{
-    CIsochartMesh *pChartWithMaxL2Stretch = nullptr;
-    uint32_t dwMaxIdx = 0;
-
-    if (IsIMTSpecified())
-    {
-        float fMaxStretch;
-        dwMaxIdx = CIsochartMesh::GetChartWidthLargestGeoAvgStretch(
-            m_finalChartList,
-            fMaxStretch);
-    }
-    else
-    {
-        dwMaxIdx =
-            CIsochartMesh::GetBestPartitionCanidate(m_finalChartList);
-    }
-    assert(INVALID_INDEX != dwMaxIdx);
-
-    pChartWithMaxL2Stretch = m_finalChartList[dwMaxIdx];
-    assert(pChartWithMaxL2Stretch != nullptr);
-
-    HRESULT hr = pChartWithMaxL2Stretch->Bipartition3D();
-    if (FAILED(hr))
-    {
-        return hr;
-    }
-    else
-    {
-        if (pChartWithMaxL2Stretch->HasChildren())
-        {
-            if (FAILED(
-                hr = AddChildrenToCurrentChartHeap(pChartWithMaxL2Stretch)))
-            {
-                delete pChartWithMaxL2Stretch;
-                return hr;
-            }
-            else
-            {
-                if (!pChartWithMaxL2Stretch->IsInitChart())
-                {
-                    delete pChartWithMaxL2Stretch;
-                }
-            }
-        }
-    }
-    m_finalChartList.erase(m_finalChartList.begin() + ptrdiff_t(dwMaxIdx));
     return S_OK;
 }
 
@@ -537,6 +785,7 @@ HRESULT CIsochartEngine::OptimizeParameterizedCharts(
     float &fFinalGeoAvgL2Stretch)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE("Engine::OptimizeParameterizedCharts");
 
     float fCurrAvgL2SquaredStretch;
     if (IsIMTSpecified())
@@ -622,6 +871,8 @@ HRESULT CIsochartEngine::PartitionByGlobalAvgL2Stretch(
     uint32_t *pFaceAttributeIDOut)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE("Engine::Partition");
+    CaptureWorkerCount();
 
     // 1.  Check current state and parameter.
     if (ISOCHART_ST_UNINITILAIZED == m_state)
@@ -665,12 +916,9 @@ HRESULT CIsochartEngine::PartitionByGlobalAvgL2Stretch(
     DPF(0, "Initial chart number %zu\n", m_currentChartHeap.size());
     do
     {
-        // 3.1. Generate initial parameterization for charts in current chart heap
-    #ifdef _OPENMP
-        hr = ParameterizeChartsInHeapParallelized(bCountParition, MaxChartNumber);
-    #else
+        // 3.1. Parameterize every chart currently queued. Independent charts run
+        // concurrently; children produced by a split are queued for a later turn.
         hr = ParameterizeChartsInHeap(bCountParition, MaxChartNumber);
-    #endif
         if (FAILED(hr))
             return hr;
 
@@ -814,6 +1062,12 @@ HRESULT CIsochartEngine::AddChildrenToCurrentChartHeap(
 
         if (!m_currentChartHeap.insertData(pChild, 0))
         {
+            // insertData took the earlier children. Unlink those so deleting
+            // the parent does not free charts the heap already owns.
+            for (size_t linked = 0; linked < i; ++linked)
+            {
+                pChart->UnlinkChild(linked);
+            }
             return E_OUTOFMEMORY;
         }
     }
@@ -840,6 +1094,7 @@ HRESULT CIsochartEngine::Pack(
     _In_opt_ std::vector<uint32_t> *pvAttributeID) noexcept
 {
     DPF(1, "Packing Charts...");
+    UVATLAS_TIME_SCOPE("Engine::Pack");
     if (!CheckPackParameters(
         Width, Height, Gutter,
         pvVertexArrayOut,
@@ -1209,6 +1464,8 @@ HRESULT CIsochartEngine::ApplyInitEngine(
     bool bIsForPartition)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Engine::ApplyInitEngine", baseInfo.dwFaceCount);
+    CaptureWorkerCount();
 
     // 1. Build Root Chart
     auto pRootChart = new (std::nothrow) CIsochartMesh(baseInfo, m_callbackSchemer, *this);
@@ -1247,63 +1504,68 @@ HRESULT CIsochartEngine::ApplyInitEngine(
     m_callbackSchemer.InitCallBackAdapt(
         baseInfo.dwVertexCount * 2 + pRootChart->GetEdgeNumber(), 0.9f, 0.10f);
 
+    // Later partition rounds insert into this same heap. Automatic mode has to
+    // be enabled before the first insertData, which used to happen here.
     m_currentChartHeap.SetManageMode(AUTOMATIC);
-    if (!m_currentChartHeap.insertData(pRootChart, 0))
-    {
-        delete pRootChart;
-        return E_OUTOFMEMORY;
-    }
+
+    // Charts created while cutting boundaries or separating components are
+    // independent, so the same work queue used for parameterization runs them
+    // together. One connected mesh still cuts its own boundary loops inside
+    // PrepareProcessing; that part is batched per chart.
+    std::vector<CIsochartMesh *> seed(1, pRootChart);
+    std::vector<CIsochartMesh *> prepared;
+    hr = DrainChartQueue(
+        std::move(seed),
+        prepared,
+        m_dwWorkerCount,
+        false,
+        m_callbackSchemer,
+        [bIsForPartition](CIsochartMesh &chart) {
+            return chart.PrepareProcessing(bIsForPartition);
+        });
     size_t dwTestVertexCount = 0;
     size_t dwTestFaceCount = 0;
-    while (!m_currentChartHeap.empty())
+    for (CIsochartMesh *pChart : prepared)
     {
-        CIsochartMesh *pChart = m_currentChartHeap.cutTopData();
-        assert(pChart != nullptr);
-        _Analysis_assume_(pChart != nullptr);
-        assert(!pChart->IsImportanceCaculationDone());
-
-        if (FAILED(hr = pChart->PrepareProcessing(bIsForPartition)))
+        if (!pChart)
         {
-            delete pChart;
-            return hr;
+            continue;
         }
-
-        DPF(3, "Separate to %zu sub-charts", pChart->GetChildrenCount());
-        // if original mesh has multiple sub-charts or current chart
-        // has multiple boundaies it will generate children.
-
-        if (pChart->HasChildren())
+        if (FAILED(hr))
         {
-            for (size_t i = 0; i < pChart->GetChildrenCount(); i++)
-            {
-                CIsochartMesh *pChild = pChart->GetChild(i);
-                assert(pChild != nullptr);
-                assert(!pChild->IsImportanceCaculationDone());
-
-                if (!m_currentChartHeap.insertData(pChild, 0))
-                {
-                    delete pChart;
-                    return E_OUTOFMEMORY;
-                }
-                pChart->UnlinkChild(i);
-            }
-            delete pChart;
-        }
-        else
-        {
-            assert(pChart->IsImportanceCaculationDone() || !bIsForPartition);
-            try
-            {
-                m_initChartList.push_back(pChart);
-            }
-            catch (std::bad_alloc &)
+            if (!pChart->IsInitChart())
             {
                 delete pChart;
-                return E_OUTOFMEMORY;
             }
-            dwTestVertexCount += pChart->GetVertexNumber();
-            dwTestFaceCount += pChart->GetFaceNumber();
+            else
+            {
+                try
+                {
+                    m_initChartList.push_back(pChart);
+                }
+                catch (std::bad_alloc &)
+                {
+                    return E_OUTOFMEMORY;
+                }
+            }
+            continue;
         }
+        assert(pChart->IsImportanceCaculationDone() || !bIsForPartition);
+        try
+        {
+            m_initChartList.push_back(pChart);
+        }
+        catch (std::bad_alloc &)
+        {
+            delete pChart;
+            return E_OUTOFMEMORY;
+        }
+        dwTestVertexCount += pChart->GetVertexNumber();
+        dwTestFaceCount += pChart->GetFaceNumber();
+    }
+    if (FAILED(hr))
+    {
+        return hr;
     }
 
     std::ignore = dwTestVertexCount;

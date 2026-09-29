@@ -13,6 +13,8 @@
 #include "callbackschemer.h"
 #include "maxheap.hpp"
 
+#include <mutex>
+
 namespace Isochart
 {
     class CCallbackSchemer;
@@ -82,9 +84,14 @@ namespace Isochart
 
         float UniformRand(float maxValue) const
         {
+            std::lock_guard<std::mutex> lock(m_randMutex);
             std::uniform_real_distribution<float> dis(0.f, maxValue);
             return dis(m_randomEngine);
         }
+
+        // Charts processed at once by the engine work queue. 1 keeps the
+        // historical serial loop.
+        size_t WorkerCount() const noexcept { return m_dwWorkerCount; }
 
     private:
         enum EngineState
@@ -127,16 +134,11 @@ namespace Isochart
             size_t &ChartNumberOut,
             float &MaxChartStretchOut,
             uint32_t *pFaceAttributeIDOut);
-    #ifdef _OPENMP
-        HRESULT ParameterizeChartsInHeapParallelized(
-            bool bFirstTime,
-            size_t MaxChartNumber);
-    #else
         HRESULT ParameterizeChartsInHeap(
             bool bFirstTime,
             size_t MaxChartNumber);
-    #endif
         HRESULT GenerateNewChartsToParameterize();
+        void CaptureWorkerCount() noexcept;
 
         HRESULT OptimizeParameterizedCharts(
             float Stretch,
@@ -253,7 +255,10 @@ namespace Isochart
 
         unsigned int m_dwOptions;
 
+        size_t m_dwWorkerCount;
+
         mutable std::mt19937_64 m_randomEngine;
+        mutable std::mutex m_randMutex;
 
         friend CIsochartMesh;
     };

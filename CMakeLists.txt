@@ -48,6 +48,8 @@ option(ENABLE_CODE_ANALYSIS "Use Static Code Analysis on build" OFF)
 
 option(ENABLE_CODE_PROFILING "Build for profiling" OFF)
 
+option(UVATLAS_ENABLE_TIMING "Enable local phase timing instrumentation" OFF)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -159,6 +161,10 @@ if(UVATLAS_USE_OPENMP)
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE UVAtlas UVAtlas/geodesics UVAtlas/isochart)
+
+if(UVATLAS_ENABLE_TIMING)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE UVATLAS_ENABLE_TIMING)
+endif()
 
 if(NOT MINGW)
     target_precompile_headers(${PROJECT_NAME} PRIVATE UVAtlas/pch.h)

@@ -13,10 +13,35 @@
 #include "ExactOneToAll.h"
 #include "ApproximateOneToAll.h"
 #include "mathutils.h"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 using namespace GeodesicDist;
 using namespace DirectX;
+
+#if defined(UVATLAS_ENABLE_TIMING)
+namespace
+{
+    std::atomic<unsigned long long> g_ks98_us{ 0 };
+    std::atomic<unsigned long long> g_newgeodist_us{ 0 };
+
+    struct GeoEngineScope
+    {
+        std::atomic<unsigned long long>& sink;
+        std::chrono::steady_clock::time_point start;
+
+        explicit GeoEngineScope(std::atomic<unsigned long long>& s)
+            : sink(s), start(std::chrono::steady_clock::now()) {}
+
+        ~GeoEngineScope()
+        {
+            const auto end = std::chrono::steady_clock::now();
+            sink += static_cast<unsigned long long>(
+                std::chrono::duration<double, std::micro>(end - start).count());
+        }
+    };
+}
+#endif
 
 // define the macro to use the exact algorithm, otherwise the fast approximate algorithm is employed
 #ifdef _USE_EXACT_ALGORITHM
@@ -47,6 +72,7 @@ HRESULT CIsochartMesh::CalculateLandmarkVertices(
 {
     assert(m_pVerts != nullptr);
     assert(m_bVertImportanceDone);
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalculateLandmarkVertices", m_dwVertNumber);
 
     std::unique_ptr<uint32_t[]> landmark(new (std::nothrow) uint32_t[m_dwVertNumber]);
     if (!landmark)
@@ -227,6 +253,11 @@ HRESULT CIsochartMesh::CalculateGeodesicDistance(
     {
         return S_OK;
     }
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalculateGeodesicDistance(landmarks)", vertList.size());
+#if defined(UVATLAS_ENABLE_TIMING)
+    const unsigned long long ks98_before = g_ks98_us.load(std::memory_order_relaxed);
+    const unsigned long long newgeodist_before = g_newgeodist_us.load(std::memory_order_relaxed);
+#endif
     assert(!(!pfVertGeodesicDistance && !pfVertCombineDistance));
 
     HRESULT hr = S_OK;
@@ -339,6 +370,12 @@ HRESULT CIsochartMesh::CalculateGeodesicDistance(
     {
         delete[] pfTempGeodesicDistance;
     }
+
+#if defined(UVATLAS_ENABLE_TIMING)
+    std::fprintf(stderr, "[uvatlas]   geodesic engines: ks98=%8.2f ms  newgeodist=%8.2f ms\n",
+        static_cast<double>(g_ks98_us.load(std::memory_order_relaxed) - ks98_before) / 1000.0,
+        static_cast<double>(g_newgeodist_us.load(std::memory_order_relaxed) - newgeodist_before) / 1000.0);
+#endif
 
     return S_OK;
 }
@@ -478,6 +515,9 @@ HRESULT CIsochartMesh::CalculateGeodesicDistanceToVertexNewGeoDist(
     uint32_t dwSourceVertID,
     uint32_t *pdwFarestPeerVertID)
 {
+#if defined(UVATLAS_ENABLE_TIMING)
+    const GeoEngineScope _uvas_geo_scope{ g_newgeodist_us };
+#endif
     try
     {
         ONE_TO_ALL_ENGINE.SetSrcVertexIdx(dwSourceVertID);
@@ -517,6 +557,9 @@ HRESULT CIsochartMesh::CalculateGeodesicDistanceToVertexKS98(
     bool bIsSignalDistance,
     uint32_t *pdwFarestPeerVertID) const
 {
+#if defined(UVATLAS_ENABLE_TIMING)
+    const GeoEngineScope _uvas_geo_scope{ g_ks98_us };
+#endif
     uint32_t dwFarestVertID = 0;
 
     std::unique_ptr<bool[]> pbVertProcessed(new (std::nothrow) bool[m_dwVertNumber]);
@@ -749,6 +792,7 @@ HRESULT CIsochartMesh::CalculateVertMappingCoord(
                                 // store UV coordinate in vertex
 {
     assert(pfVertGeodesicDistance != nullptr);
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalculateVertMappingCoord", m_dwVertNumber);
     assert(dwPrimaryEigenDimension >= 2);
     _Analysis_assume_(dwPrimaryEigenDimension >= 2);
 

@@ -9,6 +9,8 @@
 
 #include "pch.h"
 #include "isochartmesh.h"
+#include "segmentoverlap.h"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 using namespace DirectX;
@@ -1186,6 +1188,8 @@ HRESULT CIsochartMesh::ProcessPlaneShape(
 static bool IsSelfOverlapping(
     CIsochartMesh *pChart)
 {
+    UVATLAS_TIME_SCOPE_WORK("Overlap::IsSelfOverlapping(edges)", pChart->GetEdgeNumber());
+
     auto &edgeList1 = pChart->GetEdgesList();
     ISOCHARTVERTEX *pVertList1 = pChart->GetVertexBuffer();
 
@@ -1194,93 +1198,89 @@ static bool IsSelfOverlapping(
         return false;
     }
 
-    for (size_t jj = 0; jj < edgeList1.size() - 1; jj++)
-    {
-        ISOCHARTEDGE &edge1 = edgeList1[jj];
-        const XMFLOAT2 &v1 = pVertList1[edge1.dwVertexID[0]].uv;
-        const XMFLOAT2 &v2 = pVertList1[edge1.dwVertexID[1]].uv;
+    ISOCHARTFACE *pFaceList1 = pChart->GetFaceBuffer();
+    const CBaseMeshInfo &baseInfo = pChart->GetBaseMeshInfo();
 
-        for (size_t kk = jj + 1; kk < edgeList1.size(); kk++)
+    return Isochart::detail::AnySegmentsIntersectFast(
+        edgeList1.size(),
+        [&](size_t i, uint32_t &vid0, uint32_t &vid1,
+            DirectX::XMFLOAT2 &p0, DirectX::XMFLOAT2 &p1)
         {
-            ISOCHARTEDGE &edge2 = edgeList1[kk];
+            const ISOCHARTEDGE &edge = edgeList1[i];
+            vid0 = edge.dwVertexID[0];
+            vid1 = edge.dwVertexID[1];
+            p0 = pVertList1[vid0].uv;
+            p1 = pVertList1[vid1].uv;
+        },
+        [&](size_t i, size_t j) -> bool
+        {
+            const ISOCHARTEDGE &edge1 = edgeList1[i];
+            const ISOCHARTEDGE &edge2 = edgeList1[j];
 
-            // If the 2 edges are adjacent, skip checking
-            if (edge1.dwVertexID[0] == edge2.dwVertexID[0] || edge1.dwVertexID[0] == edge2.dwVertexID[1] || edge1.dwVertexID[1] == edge2.dwVertexID[0] || edge1.dwVertexID[1] == edge2.dwVertexID[1])
+            uint32_t dwFaceRootID =
+                pFaceList1[edge1.dwFaceID[0]].dwIDInRootMesh;
+            if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
             {
-                continue;
+                return false;
             }
+
+            if (edge1.dwFaceID[1] != INVALID_FACE_ID)
+            {
+                dwFaceRootID =
+                    pFaceList1[edge1.dwFaceID[1]].dwIDInRootMesh;
+                if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
+                {
+                    return false;
+                }
+            }
+            dwFaceRootID =
+                pFaceList1[edge2.dwFaceID[0]].dwIDInRootMesh;
+            if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
+            {
+                return false;
+            }
+
+            if (edge2.dwFaceID[1] != INVALID_FACE_ID)
+            {
+                dwFaceRootID =
+                    pFaceList1[edge2.dwFaceID[1]].dwIDInRootMesh;
+                if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
+                {
+                    return false;
+                }
+            }
+
+            const XMFLOAT2 &v1 = pVertList1[edge1.dwVertexID[0]].uv;
+            const XMFLOAT2 &v2 = pVertList1[edge1.dwVertexID[1]].uv;
             const XMFLOAT2 &v3 = pVertList1[edge2.dwVertexID[0]].uv;
             const XMFLOAT2 &v4 = pVertList1[edge2.dwVertexID[1]].uv;
-            bool bIsIntersect = IsochartIsSegmentsIntersect(v1, v2, v3, v4);
 
-            if (bIsIntersect)
-            {
-                ISOCHARTFACE *pFaceList1 = pChart->GetFaceBuffer();
-                const CBaseMeshInfo &baseInfo = pChart->GetBaseMeshInfo();
+            XMVECTOR vv1 = XMLoadFloat2(&v1);
+            XMVECTOR vv2 = XMLoadFloat2(&v2);
+            XMVECTOR vv3 = XMLoadFloat2(&v3);
+            XMVECTOR vv4 = XMLoadFloat2(&v4);
 
-                uint32_t dwFaceRootID =
-                    pFaceList1[edge1.dwFaceID[0]].dwIDInRootMesh;
-                if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
-                {
-                    continue;
-                }
+            XMVECTOR vv5 = XMVectorSubtract(vv1, vv3);
+            if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
+                return false;
 
-                if (edge1.dwFaceID[1] != INVALID_FACE_ID)
-                {
-                    dwFaceRootID =
-                        pFaceList1[edge1.dwFaceID[1]].dwIDInRootMesh;
-                    if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
-                    {
-                        continue;
-                    }
-                }
-                dwFaceRootID =
-                    pFaceList1[edge2.dwFaceID[0]].dwIDInRootMesh;
-                if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
-                {
-                    continue;
-                }
+            vv5 = XMVectorSubtract(vv1, vv4);
+            if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
+                return false;
 
-                if (edge2.dwFaceID[1] != INVALID_FACE_ID)
-                {
-                    dwFaceRootID =
-                        pFaceList1[edge2.dwFaceID[1]].dwIDInRootMesh;
-                    if (IsInZeroRange2(baseInfo.pfFaceAreaArray[dwFaceRootID]))
-                    {
-                        continue;
-                    }
-                }
+            vv5 = XMVectorSubtract(vv2, vv3);
+            if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
+                return false;
 
-                XMVECTOR vv1 = XMLoadFloat2(&v1);
-                XMVECTOR vv2 = XMLoadFloat2(&v2);
-                XMVECTOR vv3 = XMLoadFloat2(&v3);
-                XMVECTOR vv4 = XMLoadFloat2(&v4);
+            vv5 = XMVectorSubtract(vv2, vv4);
+            if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
+                return false;
 
-                XMVECTOR vv5 = XMVectorSubtract(vv1, vv3);
-                if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
-                    continue;
+            DPF(1, "(%f, %f) (%f, %f) --> (%f, %f) (%f, %f)",
+                double(v1.x), double(v1.y), double(v2.x), double(v2.y), double(v3.x), double(v3.y), double(v4.x), double(v4.y));
 
-                vv5 = XMVectorSubtract(vv1, vv4);
-                if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
-                    continue;
-
-                vv5 = XMVectorSubtract(vv2, vv3);
-                if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
-                    continue;
-
-                vv5 = XMVectorSubtract(vv2, vv4);
-                if (IsInZeroRange(XMVectorGetX(XMVector2Length(vv5))))
-                    continue;
-
-                DPF(1, "(%f, %f) (%f, %f) --> (%f, %f) (%f, %f)",
-                    double(v1.x), double(v1.y), double(v2.x), double(v2.y), double(v3.x), double(v3.y), double(v4.x), double(v4.y));
-
-                return true;
-            }
-        }
-    }
-
-    return false;
+            return true;
+        });
 }
 
 HRESULT CIsochartMesh::ProcessPlaneLikeShape(
@@ -1289,6 +1289,7 @@ HRESULT CIsochartMesh::ProcessPlaneLikeShape(
     bool &bPlaneLikeShape)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::ProcessPlaneLikeShape", m_dwFaceNumber);
 
     bPlaneLikeShape = false;
 
@@ -1590,6 +1591,7 @@ HRESULT CIsochartMesh::ProcessSpecialShape(
     size_t dwMaxEigenDimension,
     bool &bSpecialShape)
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::ProcessSpecialShape", m_dwFaceNumber);
     UNREFERENCED_PARAMETER(pfVertCombineDistance);
 
     HRESULT hr = S_OK;
@@ -2083,6 +2085,7 @@ HRESULT CIsochartMesh::ProcessGeneralShape(
     const float *pfVertMappingCoord)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::ProcessGeneralShape", m_dwFaceNumber);
 
     assert(m_children.empty());
 
@@ -2202,6 +2205,7 @@ HRESULT CIsochartMesh::CalculateRepresentiveVertices(
     const float *pfVertMappingCoord)
 {
     representativeVertsIdx.clear();
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalculateRepresentiveVertices", m_dwVertNumber);
 #ifdef BIPARTITION
     for (size_t dwDimIndex = 0;
         dwDimIndex < dwPrimaryEigenDimension;
@@ -2423,6 +2427,7 @@ HRESULT CIsochartMesh::PartitionGeneralShape(
 {
     DPF(3, "Partition General shape...\n");
     bIsPartitionSucceed = false;
+    UVATLAS_TIME_SCOPE_WORK("Chart::PartitionGeneralShape", m_dwFaceNumber);
 
     // Only one representative vertex, no need to cluster vertices.
     if (representativeVertsIdx.size() < 2)

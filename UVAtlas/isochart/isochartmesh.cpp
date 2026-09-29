@@ -46,10 +46,16 @@
 */
 
 #include "pch.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
 #include "maxheap.hpp"
 #include "isochartmesh.h"
 #include "progressivemesh.h"
 #include "vertiter.h"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 using namespace DirectX;
@@ -259,6 +265,7 @@ HRESULT CIsochartMesh::BuildRootChart(
 {
     assert(pFaceIndexArray != nullptr);
     assert(pChart != nullptr);
+    UVATLAS_TIME_SCOPE_WORK("Chart::BuildRootChart", baseInfo.dwFaceCount);
 
     HRESULT hr = S_OK;
 
@@ -382,16 +389,20 @@ namespace
     };
 
     static bool IsNeedToSplit(
-        std::vector<EdgeInfoItem> &edgeList,
+        std::unordered_map<uint64_t, EdgeInfoItem> &edgeMap,
+        uint32_t dwVertexID0,
         uint32_t dwPeerVertID,
         uint32_t dwCurrentFaceID,
         uint32_t *rgdwAdjacency,
         EdgeInfoItem **ppEdge)
     {
-        for (size_t i = 0; i < edgeList.size(); i++)
+        const uint64_t key = (static_cast<uint64_t>(dwVertexID0) << 32) |
+            static_cast<uint64_t>(dwPeerVertID);
+        const auto existing = edgeMap.find(key);
+        if (existing != edgeMap.end())
         {
-            EdgeInfoItem &et = edgeList[i];
-            if (dwPeerVertID == et.dwPeerVertID)
+            EdgeInfoItem &et = existing->second;
+            assert(et.dwPeerVertID == dwPeerVertID);
             {
                 assert(et.dwFaceID[0] != INVALID_FACE_ID);
                 *ppEdge = &et;
@@ -418,18 +429,19 @@ namespace
         edgeInfo.dwFaceID[0] = dwCurrentFaceID;
         edgeInfo.dwFaceID[1] = INVALID_FACE_ID;
         edgeInfo.bSplit = false;
-        edgeList.push_back(edgeInfo);
+        *ppEdge = &edgeMap.emplace(key, edgeInfo).first->second;
         return false;
     }
 
-    static HRESULT AddConnectedFalseEdges(std::vector<uint32_t> *pList, const uint32_t *pdwAdj, const uint32_t *pdwFalseEdges, uint32_t uFace)
+    static HRESULT AddConnectedFalseEdges(std::vector<uint32_t> *pList, std::unordered_set<uint32_t> *pListSet, const uint32_t *pdwAdj, const uint32_t *pdwFalseEdges, uint32_t uFace)
     {
-        if (isInArray(*pList, uFace))
+        if (pListSet->count(uFace) != 0)
             return S_OK;
 
         try
         {
             pList->push_back(uFace);
+            pListSet->insert(uFace);
         }
         catch (std::bad_alloc &)
         {
@@ -446,7 +458,7 @@ namespace
             size_t uNeighbor = uFace * 3 + i;
             if (pdwFalseEdges[uNeighbor] != uint32_t(-1))
             {
-                if (FAILED(hr = AddConnectedFalseEdges(pList, pdwAdj, pdwFalseEdges, pdwAdj[uNeighbor])))
+                if (FAILED(hr = AddConnectedFalseEdges(pList, pListSet, pdwAdj, pdwFalseEdges, pdwAdj[uNeighbor])))
                     return hr;
             }
         }
@@ -463,13 +475,12 @@ namespace
         bool &bChangedVertex)
     {
         bChangedVertex = false;
+        UVATLAS_TIME_SCOPE_WORK("RootChart::SplitSharedEdges", dwFaceCount);
 
         std::vector<uint32_t> splitFaceList;
-        std::unique_ptr<std::vector<EdgeInfoItem>[]> pVertEdgeList(new (std::nothrow) std::vector<EdgeInfoItem>[dwNewVertCount]);
-        if (!pVertEdgeList)
-        {
-            return E_OUTOFMEMORY;
-        }
+        std::unordered_set<uint32_t> splitFaceSet;
+        std::unordered_map<uint64_t, EdgeInfoItem> edgeMap;
+        edgeMap.reserve(dwFaceCount * 2);
 
         std::vector<uint32_t> splitEdgePos;
 
@@ -488,28 +499,44 @@ namespace
 
                 EdgeInfoItem *pEdge = nullptr;
                 if (IsNeedToSplit(
-                    pVertEdgeList[v1],
+                    edgeMap,
+                    v1,
                     v2,
                     static_cast<uint32_t>(iFace),
                     rgdwAdjacency,
                     &pEdge))
                 {
-                    HRESULT hr = AddConnectedFalseEdges(&splitFaceList, rgdwAdjacency, rgdwFalseEdges, static_cast<uint32_t>(iFace));
+                    HRESULT hr = AddConnectedFalseEdges(&splitFaceList, &splitFaceSet, rgdwAdjacency, rgdwFalseEdges, static_cast<uint32_t>(iFace));
                     if (FAILED(hr))
                     {
                         return hr;
                     }
                     if (!pEdge->bSplit)
                     {
-                        if (!addNoduplicateItem(splitFaceList, pEdge->dwFaceID[0]))
+                        auto insertFace = [&](uint32_t faceID) -> HRESULT
                         {
-                            return E_OUTOFMEMORY;
+                            if (splitFaceSet.insert(faceID).second)
+                            {
+                                try
+                                {
+                                    splitFaceList.push_back(faceID);
+                                }
+                                catch (std::bad_alloc &)
+                                {
+                                    return E_OUTOFMEMORY;
+                                }
+                            }
+                            return S_OK;
+                        };
+                        if (FAILED(hr = insertFace(pEdge->dwFaceID[0])))
+                        {
+                            return hr;
                         }
                         if (pEdge->dwFaceID[1] != INVALID_FACE_ID)
                         {
-                            if (!addNoduplicateItem(splitFaceList, pEdge->dwFaceID[1]))
+                            if (FAILED(hr = insertFace(pEdge->dwFaceID[1])))
                             {
-                                return E_OUTOFMEMORY;
+                                return hr;
                             }
                         }
                         pEdge->bSplit = true;
@@ -556,12 +583,25 @@ namespace
         size_t dwFaceCount,
         size_t &dwNewVertCount)
     {
+        UVATLAS_TIME_SCOPE_WORK("RootChart::ReorderVertices", dwFaceCount);
         CVertIter vertIter(rgdwAdjacency);
         memset(rgdwNewFaceIdx, 0xff, dwFaceCount * 3 * sizeof(uint32_t));
 
         dwNewVertCount = 0;
+        size_t dwNextReport = 0;
+#if defined(UVATLAS_ENABLE_TIMING)
+        size_t dwDerailedWalks = 0;
+#endif
         for (size_t iFace = 0; iFace < dwFaceCount; iFace++)
         {
+            if (iFace >= dwNextReport)
+            {
+                std::fprintf(stderr,
+                    "[uvatlas]       ReorderVertices progress: %zu/%zu faces, newVerts=%zu\n",
+                    iFace, dwFaceCount, dwNewVertCount);
+                std::fflush(stderr);
+                dwNextReport = iFace + 50000;
+            }
             for (size_t iVert = 0; iVert < 3; iVert++)
             {
                 if (rgdwNewFaceIdx[iFace * 3 + iVert] != INVALID_VERT_ID)
@@ -581,6 +621,19 @@ namespace
                     uint32_t dwCurFaceID = vertIter.GetCurrentFace();
                     uint32_t dwCurVertIdx = vertIter.GetCurrentVertIdx();
 
+                    // Non-manifold input can derail this fan walk so that it never
+                    // returns to the begin face, which would spin forever. Every
+                    // corner visited by this walk carries the walk's own vertex id,
+                    // so meeting one again proves the fan is broken: stop instead of
+                    // looping, and let SplitSharedEdges() handle the seam.
+                    if (FACE_ARRAY_ITME(rgdwNewFaceIdx, dwCurFaceID, dwCurVertIdx) == dwCenterVertID)
+                    {
+#if defined(UVATLAS_ENABLE_TIMING)
+                        ++dwDerailedWalks;
+#endif
+                        break;
+                    }
+
                     FACE_ARRAY_ITME(
                         rgdwNewFaceIdx, dwCurFaceID, dwCurVertIdx) = dwCenterVertID;
                 }
@@ -588,12 +641,21 @@ namespace
             }
         }
 
+#if defined(UVATLAS_ENABLE_TIMING)
+        if (dwDerailedWalks != 0)
+        {
+            std::fprintf(stderr,
+                "[uvatlas]       ReorderVertices: bounded %zu derailed fan walks (non-manifold input)\n",
+                dwDerailedWalks);
+        }
+#endif
         return S_OK;
     }
 }
 
 HRESULT CIsochartMesh::ReBuildRootChartByAdjacence()
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::ReBuildRootChartByAdjacence", m_dwFaceNumber);
     assert(m_baseInfo.bIsFaceAdjacenctArrayReady);
 
     std::unique_ptr<uint32_t[]> rgdwNewFaceIdx(new (std::nothrow) uint32_t[m_dwFaceNumber * 3]);
@@ -686,6 +748,7 @@ HRESULT CIsochartMesh::PrepareProcessing(
     bool bIsForPartition)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::PrepareProcessing", m_dwFaceNumber);
     size_t dwBoundaryNumber = 0;
     bool bIsSimpleChart = false;
 
@@ -721,6 +784,7 @@ HRESULT CIsochartMesh::PrepareProcessing(
 HRESULT CIsochartMesh::Partition()
 {
     assert(m_bVertImportanceDone);
+    UVATLAS_TIME_SCOPE_WORK("Chart::Partition", m_dwFaceNumber);
 
     HRESULT hr = S_OK;
 
@@ -838,6 +902,7 @@ LEnd:
 HRESULT CIsochartMesh::ComputeBiParitionLandmark()
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::ComputeBiParitionLandmark", m_dwVertNumber);
     if (m_bOrderedLandmark)
     {
         return S_OK;
@@ -1129,6 +1194,7 @@ HRESULT CIsochartMesh::PrepareSimpleChart(
     bool &bIsSimpleChart)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::PrepareSimpleChart", m_dwFaceNumber);
 
     dwBoundaryNumber = 0;
     bIsSimpleChart = false;
@@ -1190,6 +1256,8 @@ HRESULT CIsochartMesh::IsomapParameterlization(
     float **ppfVertCombineDistance,
     float **ppfVertMappingCoord)
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::IsomapParameterization", m_dwVertNumber);
+
     assert(ppfVertGeodesicDistance != nullptr);
     assert(ppfVertCombineDistance != nullptr);
     assert(ppfVertMappingCoord != nullptr);
@@ -1373,6 +1441,7 @@ LEnd:
 HRESULT CIsochartMesh::BuildFullConnection(bool &bIsManifold)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::BuildFullConnection", m_dwFaceNumber);
 
     assert(m_pVerts != nullptr);
     assert(m_pFaces != nullptr);
@@ -1468,6 +1537,7 @@ namespace
 HRESULT CIsochartMesh::FindAllEdges(
     bool &bIsManifold)
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::FindAllEdges", m_dwFaceNumber);
     ISOCHARTEDGE *pEdge;
     ISOCHARTEDGE tempEdge;
     EdgeTableItem tempEdgeTableItem;
@@ -1631,6 +1701,7 @@ public:
 HRESULT CIsochartMesh::CleanNonmanifoldMesh(bool &bCleaned)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Chart::CleanNonmanifoldMesh", m_dwVertNumber);
     std::vector<uint32_t> vertexFaceList;
     std::vector<uint32_t> newVertMap;
     uint32_t dwNewVertID;
@@ -1780,6 +1851,7 @@ HRESULT CIsochartMesh::CleanNonmanifoldMesh(bool &bCleaned)
 
 HRESULT CIsochartMesh::SetEdgeSplitAttribute()
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::SetEdgeSplitAttribute", m_dwEdgeNumber);
     // The the bCanBeSplit item of each edge. If user don't specified the parameter, all edges can
     // be splitted
     HRESULT hr = S_OK;
@@ -1867,6 +1939,7 @@ bool CIsochartMesh::IsAllFaceVertexOrderValid()
 HRESULT CIsochartMesh::SortAdjacentVertices(
     bool &bIsManifold)
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::SortAdjacentVertices", m_dwVertNumber);
     bIsManifold = false;
 
     try
@@ -2258,6 +2331,7 @@ void CIsochartMesh::GetFaceAdjacentArray(
 HRESULT CIsochartMesh::CheckAndDivideMultipleObjects(
     bool &bHasMultiObjects)
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::CheckAndDivideMultipleObjects", m_dwVertNumber);
 
     assert(m_dwVertNumber != 0 || m_dwFaceNumber != 0);
 
@@ -2411,6 +2485,10 @@ HRESULT CIsochartMesh::ExtractIndependentObject(
     }
     if (!bManifold)
     {
+        std::fprintf(stderr,
+            "[uvatlas] extract-component nonmanifold faces %zu\n",
+            pChart->m_dwFaceNumber);
+        std::fflush(stderr);
         delete pChart;
         return HRESULT_E_INVALID_DATA;
     }
@@ -2434,6 +2512,7 @@ HRESULT CIsochartMesh::CheckAndCutMultipleBoundaries(
 {
     assert(m_dwVertNumber != 0);
     DPF(3, "Check and cut multi boundary...\n");
+    UVATLAS_TIME_SCOPE_WORK("Chart::CheckAndCutMultipleBoundaries", m_dwVertNumber);
 
     dwBoundaryNumber = 0;
 
@@ -2500,6 +2579,7 @@ HRESULT CIsochartMesh::FindAllBoundaries(
     uint32_t *pdwVertBoundaryID)
 {
     assert(pdwVertBoundaryID != nullptr);
+    UVATLAS_TIME_SCOPE_WORK("Chart::FindAllBoundaries", m_dwVertNumber);
 
     HRESULT hr = S_OK;
 
@@ -2593,6 +2673,7 @@ HRESULT CIsochartMesh::CalMinPathToOtherBoundary(
     uint32_t &dwPeerVertID,
     float &fDistance)
 {
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalMinPathToOtherBoundary", m_dwVertNumber);
     std::unique_ptr<bool[]> vertProcessed(new (std::nothrow) bool[m_dwVertNumber]);
     std::unique_ptr<CMaxHeapItem<float, uint32_t>[]> heapItem(new (std::nothrow) CMaxHeapItem<float, uint32_t>[m_dwVertNumber]);
     if (!vertProcessed || !heapItem)
@@ -2782,10 +2863,331 @@ HRESULT CIsochartMesh::CalMinPathBetweenBoundaries(
     VERTEX_ARRAY &allBoundaryList,
     std::vector<uint32_t> &boundaryRecord,
     uint32_t *pdwVertBoundaryID,
+    std::vector<uint32_t> &minDijkstraPath,
+    std::vector<std::vector<uint32_t>> *pDisjointPaths)
+{
+    HRESULT hr = S_OK;
+    float fMinDistance = FLT_MAX;
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalMinPathBetweenBoundaries(pairs)", boundaryRecord.size() - 1);
+    UNREFERENCED_PARAMETER(pdwVertBoundaryID);
+
+    // Local performance patch: the original implementation launched one
+    // multi-source Dijkstra per boundary loop and kept the closest result,
+    // costing O(B) full searches per cut round. A single labeled multi-source
+    // Dijkstra over every boundary vertex finds the same globally-closest
+    // pair of loops in one pass: the minimizing edge whose endpoints were
+    // reached from two different loops is exactly the closest pair.
+    std::unique_ptr<CMaxHeapItem<float, uint32_t>[]> heapItem(
+        new (std::nothrow) CMaxHeapItem<float, uint32_t>[m_dwVertNumber]);
+    std::unique_ptr<bool[]> vertProcessed(new (std::nothrow) bool[m_dwVertNumber]);
+    // Local fix: every reached vertex must remember which boundary loop its
+    // Dijkstra tree grew from. pdwVertBoundaryID alone is not enough because it
+    // is only meaningful for boundary vertices, so comparing it also accepts
+    // degenerate pairs such as (boundary vertex X, interior neighbour of X),
+    // whose joined path starts and ends on the same loop and therefore cuts
+    // nothing. The propagated loop id rejects those and keeps the closest
+    // genuine pair of distinct loops.
+    std::unique_ptr<uint32_t[]> vertSourceLoop(
+        new (std::nothrow) uint32_t[m_dwVertNumber]);
+    if (!heapItem || !vertProcessed || !vertSourceLoop)
+    {
+        return E_OUTOFMEMORY;
+    }
+    memset(vertProcessed.get(), 0, sizeof(bool) * m_dwVertNumber);
+    memset(vertSourceLoop.get(), 0xff, sizeof(uint32_t) * m_dwVertNumber);
+
+    auto pHeapItem = heapItem.get();
+    CMaxHeap<float, uint32_t> heap;
+    if (!heap.resize(m_dwVertNumber))
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    ISOCHARTVERTEX *pCurrentVertex = m_pVerts;
+    for (size_t i = 0; i < m_dwVertNumber; i++)
+    {
+        pCurrentVertex->fGeodesicDistance = FLT_MAX;
+        pCurrentVertex->dwNextVertIDOnPath = INVALID_VERT_ID;
+        pCurrentVertex++;
+    }
+
+    for (size_t i = 0; i + 1 < boundaryRecord.size(); i++)
+    {
+        for (size_t j = boundaryRecord[i]; j < boundaryRecord[i + 1]; j++)
+        {
+            pCurrentVertex = allBoundaryList[j];
+            pHeapItem[pCurrentVertex->dwID].m_data = pCurrentVertex->dwID;
+            if (pCurrentVertex->fGeodesicDistance > 0.0f)
+            {
+                pCurrentVertex->fGeodesicDistance = 0.0f;
+                vertSourceLoop[pCurrentVertex->dwID] = static_cast<uint32_t>(i);
+                pHeapItem[pCurrentVertex->dwID].m_weight = 0.0f;
+                if (!heap.insert(pHeapItem + pCurrentVertex->dwID))
+                {
+                    return E_OUTOFMEMORY;
+                }
+            }
+        }
+    }
+
+    while (!heap.empty())
+    {
+        CMaxHeapItem<float, uint32_t> *pTop = heap.cutTop();
+        pCurrentVertex = m_pVerts + pTop->m_data;
+        vertProcessed[pCurrentVertex->dwID] = true;
+
+        for (size_t j = 0; j < pCurrentVertex->edgeAdjacent.size(); j++)
+        {
+            const ISOCHARTEDGE &edge = m_edges[pCurrentVertex->edgeAdjacent[j]];
+            if (m_baseInfo.pdwSplitHint && !edge.bCanBeSplit)
+            {
+                continue;
+            }
+
+            const uint32_t dwAdjacentVertID =
+                (edge.dwVertexID[0] == pCurrentVertex->dwID) ? edge.dwVertexID[1] : edge.dwVertexID[0];
+
+            ISOCHARTVERTEX *pAdjacentVertex = m_pVerts + dwAdjacentVertID;
+            if (vertProcessed[dwAdjacentVertID])
+            {
+                continue;
+            }
+            const float fNewDistance = pCurrentVertex->fGeodesicDistance + edge.fLength;
+            if (pAdjacentVertex->fGeodesicDistance > fNewDistance)
+            {
+                pAdjacentVertex->fGeodesicDistance = fNewDistance;
+                pAdjacentVertex->dwNextVertIDOnPath = pCurrentVertex->dwID;
+                vertSourceLoop[dwAdjacentVertID] = vertSourceLoop[pCurrentVertex->dwID];
+
+                if (pHeapItem[dwAdjacentVertID].isItemInHeap())
+                {
+                    heap.update(pHeapItem + dwAdjacentVertID, -fNewDistance);
+                }
+                else
+                {
+                    pHeapItem[dwAdjacentVertID].m_data = dwAdjacentVertID;
+                    pHeapItem[dwAdjacentVertID].m_weight = -fNewDistance;
+                    if (!heap.insert(pHeapItem + dwAdjacentVertID))
+                    {
+                        return E_OUTOFMEMORY;
+                    }
+                }
+            }
+        }
+    }
+
+    struct BoundaryPortal
+    {
+        float dist;
+        uint32_t v0;
+        uint32_t v1;
+    };
+    std::unordered_map<uint64_t, BoundaryPortal> bestPortal;
+
+    uint32_t dwMeetVertID0 = INVALID_VERT_ID;
+    uint32_t dwMeetVertID1 = INVALID_VERT_ID;
+    for (size_t i = 0; i < m_edges.size(); i++)
+    {
+        const ISOCHARTEDGE &edge = m_edges[i];
+        if (m_baseInfo.pdwSplitHint && !edge.bCanBeSplit)
+        {
+            continue;
+        }
+
+        const uint32_t dwVertID0 = edge.dwVertexID[0];
+        const uint32_t dwVertID1 = edge.dwVertexID[1];
+        const float d0 = m_pVerts[dwVertID0].fGeodesicDistance;
+        const float d1 = m_pVerts[dwVertID1].fGeodesicDistance;
+        if (d0 == FLT_MAX || d1 == FLT_MAX)
+        {
+            continue;
+        }
+        const uint32_t dwLoop0 = vertSourceLoop[dwVertID0];
+        const uint32_t dwLoop1 = vertSourceLoop[dwVertID1];
+        if (dwLoop0 == INVALID_VERT_ID || dwLoop1 == INVALID_VERT_ID || dwLoop0 == dwLoop1)
+        {
+            continue;
+        }
+
+        const float fCandidate = d0 + edge.fLength + d1;
+        if (fCandidate < fMinDistance)
+        {
+            fMinDistance = fCandidate;
+            dwMeetVertID0 = dwVertID0;
+            dwMeetVertID1 = dwVertID1;
+        }
+        if (pDisjointPaths)
+        {
+            const uint32_t dwLoopLo = dwLoop0 < dwLoop1 ? dwLoop0 : dwLoop1;
+            const uint32_t dwLoopHi = dwLoop0 < dwLoop1 ? dwLoop1 : dwLoop0;
+            const uint64_t dwPairKey = (static_cast<uint64_t>(dwLoopLo) << 32) | dwLoopHi;
+            const auto dwFound = bestPortal.find(dwPairKey);
+            if (dwFound == bestPortal.end() || fCandidate < dwFound->second.dist)
+            {
+                bestPortal[dwPairKey] = BoundaryPortal{ fCandidate, dwVertID0, dwVertID1 };
+            }
+        }
+    }
+
+    if (dwMeetVertID0 != INVALID_VERT_ID)
+    {
+        std::vector<uint32_t> pathToSource0;
+        std::vector<uint32_t> pathToSource1;
+        FAILURE_RETURN(RetreiveVertDijkstraPathToSource(dwMeetVertID0, pathToSource0));
+        FAILURE_RETURN(RetreiveVertDijkstraPathToSource(dwMeetVertID1, pathToSource1));
+
+        minDijkstraPath.swap(pathToSource0);
+        minDijkstraPath.push_back(dwMeetVertID1);
+        for (size_t i = pathToSource1.size() - 1; i > 0; i--)
+        {
+            minDijkstraPath.push_back(pathToSource1[i - 1]);
+        }
+    }
+
+    if (pDisjointPaths)
+    {
+        pDisjointPaths->clear();
+        std::vector<BoundaryPortal> portals;
+        portals.reserve(bestPortal.size());
+        for (const auto &dwItem : bestPortal)
+        {
+            portals.push_back(dwItem.second);
+        }
+        std::sort(portals.begin(), portals.end(), [](const BoundaryPortal &a, const BoundaryPortal &b) {
+            return a.dist < b.dist;
+        });
+
+        auto fnBuildPath = [&](uint32_t dwVert0, uint32_t dwVert1, std::vector<uint32_t> &path) -> HRESULT
+        {
+            std::vector<uint32_t> pathToSource0;
+            std::vector<uint32_t> pathToSource1;
+            FAILURE_RETURN(RetreiveVertDijkstraPathToSource(dwVert0, pathToSource0));
+            FAILURE_RETURN(RetreiveVertDijkstraPathToSource(dwVert1, pathToSource1));
+            if (pathToSource0.empty() || pathToSource1.empty())
+            {
+                return S_OK;
+            }
+            path.swap(pathToSource0);
+            path.push_back(dwVert1);
+            for (size_t i = pathToSource1.size() - 1; i > 0; i--)
+            {
+                path.push_back(pathToSource1[i - 1]);
+            }
+            return S_OK;
+        };
+
+        std::vector<uint8_t> used(m_dwVertNumber, 0);
+        // Two seams between the same loop pair are a chord: they do not merge
+        // those loops and the next round then sees a non-disk. Each loop may
+        // be cut once, except the longest loop, which can receive one seam
+        // from every hole.
+        uint32_t dwOuterLoop = 0;
+        size_t dwOuterSpan = 0;
+        for (size_t i = 0; i + 1 < boundaryRecord.size(); ++i)
+        {
+            const size_t dwSpan = boundaryRecord[i + 1] - boundaryRecord[i];
+            if (dwSpan > dwOuterSpan)
+            {
+                dwOuterSpan = dwSpan;
+                dwOuterLoop = static_cast<uint32_t>(i);
+            }
+        }
+        std::vector<uint8_t> loopUsed(boundaryRecord.size(), 0);
+        std::unordered_set<uint64_t> usedPairs;
+        for (const BoundaryPortal &portal : portals)
+        {
+            std::vector<uint32_t> path;
+            const HRESULT pathHr = fnBuildPath(portal.v0, portal.v1, path);
+            if (FAILED(pathHr))
+            {
+                return pathHr;
+            }
+            if (path.size() < 2)
+            {
+                continue;
+            }
+            const uint32_t dwLoopFront = vertSourceLoop[path.front()];
+            const uint32_t dwLoopBack = vertSourceLoop[path.back()];
+            if (dwLoopFront == INVALID_VERT_ID || dwLoopBack == INVALID_VERT_ID || dwLoopFront == dwLoopBack
+                || dwLoopFront >= loopUsed.size() || dwLoopBack >= loopUsed.size())
+            {
+                continue;
+            }
+            if (!m_pVerts[path.front()].bIsBoundary || !m_pVerts[path.back()].bIsBoundary)
+            {
+                continue;
+            }
+            const uint32_t dwLoopLo = dwLoopFront < dwLoopBack ? dwLoopFront : dwLoopBack;
+            const uint32_t dwLoopHi = dwLoopFront < dwLoopBack ? dwLoopBack : dwLoopFront;
+            const uint64_t dwPairKey = (static_cast<uint64_t>(dwLoopLo) << 32) | dwLoopHi;
+            if (usedPairs.find(dwPairKey) != usedPairs.end())
+            {
+                continue;
+            }
+            const bool bTouchesOuter = (dwLoopFront == dwOuterLoop || dwLoopBack == dwOuterLoop);
+            if (!bTouchesOuter)
+            {
+                if (loopUsed[dwLoopFront] || loopUsed[dwLoopBack])
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                const uint32_t dwOther = dwLoopFront == dwOuterLoop ? dwLoopBack : dwLoopFront;
+                if (dwOther != dwOuterLoop && loopUsed[dwOther])
+                {
+                    continue;
+                }
+            }
+
+            std::vector<uint32_t> touched;
+            touched.reserve(path.size());
+            bool bClash = false;
+            for (uint32_t dwVertID : path)
+            {
+                if (dwVertID >= m_dwVertNumber || used[dwVertID])
+                {
+                    bClash = true;
+                    break;
+                }
+                used[dwVertID] = 1;
+                touched.push_back(dwVertID);
+            }
+            if (bClash)
+            {
+                for (uint32_t dwVertID : touched)
+                {
+                    used[dwVertID] = 0;
+                }
+                continue;
+            }
+            try
+            {
+                pDisjointPaths->push_back(std::move(path));
+                usedPairs.insert(dwPairKey);
+            }
+            catch (std::bad_alloc &)
+            {
+                return E_OUTOFMEMORY;
+            }
+            loopUsed[dwLoopFront] = 1;
+            loopUsed[dwLoopBack] = 1;
+        }
+    }
+
+    return hr;
+}
+
+HRESULT CIsochartMesh::CalMinPathBetweenBoundariesOriginal(
+    VERTEX_ARRAY &allBoundaryList,
+    std::vector<uint32_t> &boundaryRecord,
+    uint32_t *pdwVertBoundaryID,
     std::vector<uint32_t> &minDijkstraPath)
 {
     HRESULT hr = S_OK;
     float fMinDistance = FLT_MAX;
+    UVATLAS_TIME_SCOPE_WORK("Chart::CalMinPathBetweenBoundariesOriginal(pairs)", boundaryRecord.size() - 1);
 
     for (size_t i = 0; i < boundaryRecord.size() - 1; i++)
     {
@@ -2829,12 +3231,131 @@ HRESULT CIsochartMesh::DecreaseBoundary(
     DPF(3, "....Has %zu boundies...\n", dwBoundaryNumber);
 
     std::vector<uint32_t> minDijkstraPath;
-    FAILURE_RETURN(
-        CalMinPathBetweenBoundaries(
-            allBoundaryList,
-            boundaryRecord,
-            pdwVertBoundaryID,
-            minDijkstraPath));
+    std::vector<std::vector<uint32_t>> disjointPaths;
+    // Diagnostic toggle: UVATLAS_ORIGINAL_CUT=1 restores the pre-rewrite
+    // boundary-pair search so both variants can be compared on one build.
+    static const bool bUseOriginalCut = []()
+    {
+        char *pValue = nullptr;
+        size_t dwSize = 0;
+        const bool bSet = (_dupenv_s(&pValue, &dwSize, "UVATLAS_ORIGINAL_CUT") == 0 && pValue != nullptr);
+        free(pValue);
+        return bSet;
+    }();
+    if (bUseOriginalCut)
+    {
+        FAILURE_RETURN(
+            CalMinPathBetweenBoundariesOriginal(
+                allBoundaryList,
+                boundaryRecord,
+                pdwVertBoundaryID,
+                minDijkstraPath));
+    }
+    else
+    {
+        FAILURE_RETURN(
+            CalMinPathBetweenBoundaries(
+                allBoundaryList,
+                boundaryRecord,
+                pdwVertBoundaryID,
+                minDijkstraPath,
+                &disjointPaths));
+    }
+
+#if defined(UVATLAS_ENABLE_TIMING)
+    {
+        static std::atomic<unsigned> s_dbgCutCalls{ 0 };
+        const unsigned dbgCall = s_dbgCutCalls.fetch_add(1, std::memory_order_relaxed);
+        if (dbgCall < 6)
+        {
+            size_t dwBoundaryVerts = 0;
+            for (uint32_t vid : minDijkstraPath)
+            {
+                if (vid < m_dwVertNumber && m_pVerts[vid].bIsBoundary)
+                {
+                    ++dwBoundaryVerts;
+                }
+            }
+            std::fprintf(stderr,
+                "[uvatlas] CUT dbg#%u%s loops=%zu path=%zu boundaryVertsOnPath=%zu first=%u(%d) last=%u(%d)\n",
+                dbgCall,
+                bUseOriginalCut ? "(orig)" : "(new)",
+                boundaryRecord.size() - 1,
+                minDijkstraPath.size(),
+                dwBoundaryVerts,
+                minDijkstraPath.empty() ? 0u : minDijkstraPath.front(),
+                minDijkstraPath.empty() ? -1 : int(m_pVerts[minDijkstraPath.front()].bIsBoundary),
+                minDijkstraPath.empty() ? 0u : minDijkstraPath.back(),
+                minDijkstraPath.empty() ? -1 : int(m_pVerts[minDijkstraPath.back()].bIsBoundary));
+        }
+    }
+#endif
+
+    // Several holes can be joined in one connectivity rebuild when their
+    // geodesic corridors do not share vertices. One cut per loop rebuilds
+    // every face adjacency and dominates large scan meshes.
+    if (!bUseOriginalCut && disjointPaths.size() > 1)
+    {
+        const size_t dwBoundariesBefore = dwBoundaryNumber;
+        const HRESULT cutHr = CutChartAlongPaths(disjointPaths);
+        if (FAILED(cutHr))
+        {
+            if (cutHr != E_FAIL)
+            {
+                std::fprintf(stderr,
+                    "[uvatlas] boundary-batch rejected hr=0x%08lX loops %zu paths %zu\n",
+                    static_cast<unsigned long>(cutHr),
+                    dwBoundariesBefore,
+                    disjointPaths.size());
+                std::fflush(stderr);
+                return cutHr;
+            }
+        }
+        else if (!m_children.empty())
+        {
+            size_t dwBoundariesAfter = 0;
+            VERTEX_ARRAY childBoundaryList;
+            std::vector<uint32_t> childBoundaryRecord;
+            CIsochartMesh *pChild = m_children.back();
+            std::unique_ptr<uint32_t[]> childBoundaryId(new (std::nothrow) uint32_t[pChild->m_dwVertNumber]);
+            if (!childBoundaryId)
+            {
+                return E_OUTOFMEMORY;
+            }
+            FAILURE_RETURN(pChild->FindAllBoundaries(
+                dwBoundariesAfter,
+                childBoundaryList,
+                childBoundaryRecord,
+                childBoundaryId.get()));
+            if (dwBoundariesAfter == 0 || dwBoundariesAfter >= dwBoundariesBefore)
+            {
+                // The face buffer now lives on the child, so this cannot be
+                // retried. Failing is what keeps the init queue from spinning.
+                std::fprintf(stderr,
+                    "[uvatlas] boundary-batch no-progress loops %zu -> %zu paths %zu\n",
+                    dwBoundariesBefore,
+                    dwBoundariesAfter,
+                    disjointPaths.size());
+                std::fflush(stderr);
+                return HRESULT_E_INVALID_DATA;
+            }
+            dwBoundaryNumber = dwBoundariesAfter;
+            {
+                static std::atomic<int> s_batchReports{ 0 };
+                const int dwReport = s_batchReports.fetch_add(1, std::memory_order_relaxed);
+                if (dwReport < 8)
+                {
+                    std::fprintf(stderr,
+                        "[uvatlas] boundary-batch loops %zu -> %zu candidate-paths %zu\n",
+                        dwBoundariesBefore,
+                        dwBoundariesAfter,
+                        disjointPaths.size());
+                    std::fflush(stderr);
+                }
+            }
+            return S_OK;
+        }
+    }
 
     // 4. Cut current chart along the dijkstra path gotten by 3
     FAILURE_RETURN(
@@ -2875,6 +3396,139 @@ CIsochartMesh::CalVertWithMinDijkstraDistanceToSrc(
     }
     assert(dwPeerVertID != INVALID_VERT_ID);
 
+    return hr;
+}
+
+// Cut every vertex-disjoint path, then build adjacency a single time.
+// Returns E_FAIL when no path was applied and the chart is unchanged.
+HRESULT CIsochartMesh::CutChartAlongPaths(const std::vector<std::vector<uint32_t>> &dijkstraPaths)
+{
+    std::vector<uint32_t> splitPath;
+    std::vector<uint32_t> changeFaceList;
+    std::vector<uint32_t> corresVertList;
+    std::vector<uint8_t> used(m_dwVertNumber, 0);
+    std::unordered_set<uint32_t> usedFaces;
+
+    try
+    {
+        for (const std::vector<uint32_t> &dijkstraPath : dijkstraPaths)
+        {
+            if (dijkstraPath.size() < 2)
+            {
+                continue;
+            }
+            std::vector<uint32_t> oneSplit;
+            if (FAILED(FindSplitPath(dijkstraPath, oneSplit)))
+            {
+                return E_OUTOFMEMORY;
+            }
+            if (oneSplit.size() < 2)
+            {
+                continue;
+            }
+            if (oneSplit.front() != dijkstraPath.front() || oneSplit.back() != dijkstraPath.back())
+            {
+                continue;
+            }
+            if (!m_pVerts[oneSplit.front()].bIsBoundary || !m_pVerts[oneSplit.back()].bIsBoundary)
+            {
+                continue;
+            }
+
+            bool bOverlap = false;
+            for (uint32_t dwVertID : oneSplit)
+            {
+                if (dwVertID >= m_dwVertNumber || used[dwVertID])
+                {
+                    bOverlap = true;
+                    break;
+                }
+            }
+            if (bOverlap)
+            {
+                continue;
+            }
+
+            std::vector<uint32_t> oneFaces;
+            std::vector<uint32_t> oneCorres;
+            if (FAILED(FindFacesAffectedBySplit(oneSplit, oneFaces, oneCorres)))
+            {
+                return E_OUTOFMEMORY;
+            }
+            // A face already claimed by another cut would be rewritten toward
+            // two seams. Skip this path; the vertices stay free for a later one.
+            std::unordered_set<uint32_t> pathFaces(oneFaces.begin(), oneFaces.end());
+            bool bFaceClash = false;
+            for (uint32_t dwFaceID : pathFaces)
+            {
+                if (usedFaces.find(dwFaceID) != usedFaces.end())
+                {
+                    bFaceClash = true;
+                    break;
+                }
+            }
+            if (bFaceClash)
+            {
+                continue;
+            }
+            for (uint32_t dwVertID : oneSplit)
+            {
+                used[dwVertID] = 1;
+            }
+            usedFaces.insert(pathFaces.begin(), pathFaces.end());
+            splitPath.insert(splitPath.end(), oneSplit.begin(), oneSplit.end());
+            changeFaceList.insert(changeFaceList.end(), oneFaces.begin(), oneFaces.end());
+            corresVertList.insert(corresVertList.end(), oneCorres.begin(), oneCorres.end());
+        }
+    }
+    catch (std::bad_alloc &)
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    if (splitPath.size() < 2)
+    {
+        return E_FAIL;
+    }
+    if (splitPath.size() > static_cast<size_t>(UINT32_MAX) - m_dwVertNumber)
+    {
+        return E_FAIL;
+    }
+
+    auto pChart = SplitVertices(splitPath, changeFaceList, corresVertList);
+    if (!pChart)
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    bool bManifold = false;
+    HRESULT hr = pChart->BuildFullConnection(bManifold);
+    if (SUCCEEDED(hr))
+    {
+        if (!bManifold)
+        {
+            std::fprintf(stderr,
+                "[uvatlas] boundary-batch nonmanifold paths %zu verts %zu\n",
+                dijkstraPaths.size(),
+                splitPath.size());
+            std::fflush(stderr);
+            hr = HRESULT_E_INVALID_DATA;
+        }
+        else
+        {
+            try
+            {
+                m_children.push_back(pChart);
+                return S_OK;
+            }
+            catch (std::bad_alloc &)
+            {
+                hr = E_OUTOFMEMORY;
+            }
+        }
+    }
+
+    delete pChart;
     return hr;
 }
 
@@ -3245,11 +3899,35 @@ CIsochartMesh *CIsochartMesh::SplitVertices(
 
     size_t dwNewVertNumber = m_dwVertNumber;
 
-    for (size_t i = 0; i < splitPath.size(); i++)
+    // One pass over the affected faces. The previous double loop is fine for a
+    // single short cut, but a boundary batch concatenates every accepted path
+    // and that product becomes the whole unwrap.
+    try
     {
+        std::vector<uint32_t> assignedNewId(m_dwVertNumber, INVALID_VERT_ID);
+        for (size_t i = 0; i < splitPath.size(); i++)
+        {
+            const uint32_t dwVertID = splitPath[i];
+            if (dwVertID < m_dwVertNumber && assignedNewId[dwVertID] == INVALID_VERT_ID)
+            {
+                assignedNewId[dwVertID] = static_cast<uint32_t>(dwNewVertNumber);
+            }
+            dwNewVertNumber++;
+        }
+
         for (size_t j = 0; j < changeFaceList.size(); j++)
         {
             if (changeFaceList[j] == INVALID_FACE_ID)
+            {
+                continue;
+            }
+            const uint32_t dwVertID = corresVertList[j];
+            if (dwVertID >= m_dwVertNumber)
+            {
+                continue;
+            }
+            const uint32_t dwNewVertID = assignedNewId[dwVertID];
+            if (dwNewVertID == INVALID_VERT_ID)
             {
                 continue;
             }
@@ -3257,14 +3935,18 @@ CIsochartMesh *CIsochartMesh::SplitVertices(
             ISOCHARTFACE *pFace = pChart->m_pFaces + changeFaceList[j];
             for (size_t k = 0; k < 3; k++)
             {
-                if (pFace->dwVertexID[k] == splitPath[i] && corresVertList[j] == splitPath[i])
+                if (pFace->dwVertexID[k] == dwVertID)
                 {
-                    pFace->dwVertexID[k] = static_cast<uint32_t>(dwNewVertNumber);
-                    changeFaceList[j] = INVALID_FACE_ID;
+                    pFace->dwVertexID[k] = dwNewVertID;
                 }
             }
+            changeFaceList[j] = INVALID_FACE_ID;
         }
-        dwNewVertNumber++;
+    }
+    catch (std::bad_alloc &)
+    {
+        delete pChart;
+        return nullptr;
     }
 
     changeFaceList.clear();

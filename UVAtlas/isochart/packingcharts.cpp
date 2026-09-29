@@ -66,6 +66,7 @@
 #include "pch.h"
 #include "isochartmesh.h"
 #include "maxheap.hpp"
+#include "uvatlas_timing.h"
 
 // VECTOR field selector
 // v can be a XMFLOAT2 or XMFLOAT3 variable
@@ -2157,6 +2158,7 @@ HRESULT CIsochartMesh::PackingCharts(
     CCallbackSchemer &callbackSchemer)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Packing::PackingCharts", chartList.size());
 
 #ifdef _DEBUG
     BruteForceFoldChecking(chartList);
@@ -2472,6 +2474,7 @@ namespace
 void CIsochartMesh::SortCharts(
     ISOCHARTMESH_ARRAY &chartList)
 {
+    UVATLAS_TIME_SCOPE_WORK("Packing::SortCharts", chartList.size());
     std::sort(chartList.begin(), chartList.end(), CompareChart);
 }
 
@@ -2482,6 +2485,7 @@ HRESULT CIsochartMesh::PackingOneChart(
     size_t dwIteration)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("Packing::PackingOneChart", pChart->GetFaceNumber());
 
     auto pPackingInfo = pChart->GetPackingInfoBuffer();
 

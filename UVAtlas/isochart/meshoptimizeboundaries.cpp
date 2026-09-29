@@ -26,6 +26,7 @@
 
 #include "pch.h"
 #include "isochartmesh.h"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 using namespace DirectX;
@@ -562,6 +563,7 @@ HRESULT CIsochartMesh::OptimizeBoundaryByStretch(
     bool &bIsOptimized)
 {
     bIsOptimized = false;
+    UVATLAS_TIME_SCOPE_WORK("Chart::OptimizeBoundaryByStretch", m_dwFaceNumber);
     if (dwMaxSubchartCount < 2 || m_children.size() < 2)
     {
         return S_OK;

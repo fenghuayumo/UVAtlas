@@ -11,9 +11,12 @@
 // Signal-specialized parameterization
 //  In Proceedings of Eurographics Workshop on Rendering 2002(2002)
 
+// Local performance patch: accelerated segment-overlap testing.
+#include "segmentoverlap.h"
+#include "uvatlas_timing.h"
+
 namespace Isochart
 {
-
     /////////////////////////////////////////////////////////////
     ///////////////////////////Tool-Methods//////////////////////
     /////////////////////////////////////////////////////////////
@@ -85,9 +88,9 @@ namespace Isochart
         CIsochartMesh *pMesh,
         bool &bIsOverlapping)
     {
-
-        ISOCHARTEDGE *pEdge1 = nullptr;
-        ISOCHARTEDGE *pEdge2 = nullptr;
+        UVATLAS_TIME_SCOPE_WORK("Overlap::IsParameterizationOverlapping(boundary)",
+            std::count_if(pMesh->m_edges.begin(), pMesh->m_edges.end(),
+                [](const ISOCHARTEDGE &e) { return e.bIsBoundary; }));
 
         // Collect all boundary edges
         std::vector<ISOCHARTEDGE *> boundaryEdgeList;
@@ -96,10 +99,10 @@ namespace Isochart
         {
             for (size_t i = 0; i < pMesh->m_edges.size(); i++)
             {
-                pEdge1 = &(pMesh->m_edges[i]);
-                if (pEdge1->bIsBoundary)
+                const ISOCHARTEDGE &edge = pMesh->m_edges[i];
+                if (edge.bIsBoundary)
                 {
-                    boundaryEdgeList.push_back(pEdge1);
+                    boundaryEdgeList.push_back(&pMesh->m_edges[i]);
                 }
             }
         }
@@ -110,34 +113,21 @@ namespace Isochart
 
         assert(!boundaryEdgeList.empty());
 
-        for (size_t i = 0; i < boundaryEdgeList.size() - 1; i++)
-        {
-            pEdge1 = boundaryEdgeList[i];
-            for (size_t j = i + 1; j < boundaryEdgeList.size(); j++)
+        bIsOverlapping = detail::AnySegmentsIntersectFast(
+            boundaryEdgeList.size(),
+            [pMesh, &boundaryEdgeList](size_t i, uint32_t &vid0, uint32_t &vid1,
+                DirectX::XMFLOAT2 &p0, DirectX::XMFLOAT2 &p1)
             {
-                pEdge2 = boundaryEdgeList[j];
-
-                // if two edges connect together, although they have
-                // intersection, it's not counted as overlapping
-                if (pEdge1->dwVertexID[0] == pEdge2->dwVertexID[0] || pEdge1->dwVertexID[0] == pEdge2->dwVertexID[1] || pEdge1->dwVertexID[1] == pEdge2->dwVertexID[0] || pEdge1->dwVertexID[1] == pEdge2->dwVertexID[1])
-                {
-                    continue;
-                }
-                // If two edges doesn't connect together, but have
-                // intersection, overlapping occurs.
-                if (IsochartIsSegmentsIntersect(
-                    pMesh->m_pVerts[pEdge1->dwVertexID[0]].uv,
-                    pMesh->m_pVerts[pEdge1->dwVertexID[1]].uv,
-                    pMesh->m_pVerts[pEdge2->dwVertexID[0]].uv,
-                    pMesh->m_pVerts[pEdge2->dwVertexID[1]].uv))
-                {
-                    bIsOverlapping = true;
-                    return S_OK;
-                }
-            }
-        }
-
-        bIsOverlapping = false;
+                const ISOCHARTEDGE *edge = boundaryEdgeList[i];
+                vid0 = edge->dwVertexID[0];
+                vid1 = edge->dwVertexID[1];
+                p0 = pMesh->m_pVerts[vid0].uv;
+                p1 = pMesh->m_pVerts[vid1].uv;
+            },
+            [](size_t, size_t) -> bool
+            {
+                return true;
+            });
         return S_OK;
     }
 

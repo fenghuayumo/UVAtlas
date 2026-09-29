@@ -11,6 +11,8 @@
 
 #include "isochart.h"
 
+#include <mutex>
+
 namespace Isochart
 {
 
@@ -77,7 +79,11 @@ namespace Isochart
         void SetStage(
             unsigned int TotalStageCount,
             unsigned int DoneStageCount);
-        void IncreaseDoneStage() { m_dwDoneStage++; }
+        void IncreaseDoneStage()
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            m_dwDoneStage++;
+        }
 
         void InitCallBackAdapt(
             size_t dwTaskWork,
@@ -117,12 +123,18 @@ namespace Isochart
         unsigned int m_dwDoneStage;
 
         float m_fPercentOfAllTasks;
+
+        // Chart workers call CheckPointAdapt while the main thread may still
+        // own the schemer. The lock is recursive because progress helpers call
+        // each other.
+        mutable std::recursive_mutex m_mutex;
     };
 
     inline void CCallbackSchemer::SetCallback(
         LPISOCHARTCALLBACK pCallback,
         float Frequency)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         m_pCallback = pCallback;
         m_fCallbackFrequency = Frequency;
     }
@@ -131,12 +143,14 @@ namespace Isochart
         unsigned int TotalStageCount,
         unsigned int DoneStageCount)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         m_dwTotalStage = TotalStageCount;
         m_dwDoneStage = DoneStageCount;
     }
 
     inline float CCallbackSchemer::PercentInAllStage()
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         float fPercent = m_fBase + float(m_dwWorkDone) * m_fPercentScale;
         return (float(m_dwDoneStage) * 1.0f) / float(m_dwTotalStage) + fPercent / float(m_dwTotalStage);
     }
@@ -146,6 +160,7 @@ namespace Isochart
         float fPercentOfAllTasks,
         float fBase)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (!m_pCallback)
         {
             return;
@@ -182,6 +197,7 @@ namespace Isochart
 
     inline HRESULT CCallbackSchemer::UpdateCallbackDirectly(float fPercent)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (!m_pCallback)
         {
             return S_OK;
@@ -199,6 +215,7 @@ namespace Isochart
 
     inline HRESULT CCallbackSchemer::UpdateCallbackAdapt(size_t dwDone)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (!m_pCallback || 0 == dwDone)
         {
             return S_OK;
@@ -254,6 +271,7 @@ namespace Isochart
 
     inline HRESULT CCallbackSchemer::CheckPointAdapt()
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (!m_pCallback)
         {
             return S_OK;
@@ -265,6 +283,7 @@ namespace Isochart
 
     inline HRESULT CCallbackSchemer::FinishWorkAdapt()
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (!m_pCallback)
         {
             return S_OK;

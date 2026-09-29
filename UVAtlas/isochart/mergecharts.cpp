@@ -10,6 +10,7 @@
 #include "pch.h"
 #include "isochartmesh.h"
 #include "maxheap.hpp"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 using namespace DirectX;
@@ -28,6 +29,7 @@ HRESULT CIsochartMesh::MergeSmallCharts(
     CCallbackSchemer &callbackSchemer)
 {
     DPF(1, "#<Chart Number Before Merge> : %zu", chartList.size());
+    UVATLAS_TIME_SCOPE_WORK("Charts::MergeSmallCharts", chartList.size());
     if (chartList.size() < 4)
     {
         return S_OK;

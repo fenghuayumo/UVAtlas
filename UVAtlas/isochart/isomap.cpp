@@ -10,6 +10,7 @@
 #include "pch.h"
 #include "isomap.h"
 #include "isochartutil.h"
+#include "uvatlas_timing.h"
 
 using namespace Isochart;
 
@@ -33,6 +34,7 @@ CIsoMap::~CIsoMap()
 
 HRESULT CIsoMap::Init(size_t dwDimension, float *pGeodesicMatrix)
 {
+    UVATLAS_TIME_SCOPE_WORK("IsoMap::Init", dwDimension);
     Clear();
     assert(pGeodesicMatrix != nullptr);
     assert(m_dwCalculatedDimension == 0);
@@ -129,6 +131,7 @@ HRESULT CIsoMap::ComputeLargestEigen(
     size_t &dwCalculatedDimension)
 {
     assert(m_pfMatrixB != nullptr);
+    UVATLAS_TIME_SCOPE_WORK("IsoMap::ComputeLargestEigen", m_dwMatrixDimension);
     _Analysis_assume_(m_pfMatrixB != nullptr);
     assert(m_pfAvgSquaredDstColumn != nullptr);
     _Analysis_assume_(m_pfAvgSquaredDstColumn != nullptr);

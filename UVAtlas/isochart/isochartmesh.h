@@ -471,11 +471,23 @@ namespace Isochart
         HRESULT CutChartAlongPath(
             std::vector<uint32_t> &dijkstraPath);
 
+        // Apply every vertex-disjoint path, then rebuild connectivity once.
+        HRESULT CutChartAlongPaths(
+            const std::vector<std::vector<uint32_t>> &dijkstraPaths);
+
         HRESULT CalculateDijkstraPathToVertex(
             uint32_t dwSourceVertID,
             uint32_t *pdwFarestPeerVertID = nullptr) const;
 
         HRESULT CalMinPathBetweenBoundaries(
+            VERTEX_ARRAY &allBoundaryList,
+            std::vector<uint32_t> &boundaryRecord,
+            uint32_t *pdwVertBoundaryID,
+            std::vector<uint32_t> &minDijkstraPath,
+            std::vector<std::vector<uint32_t>> *pDisjointPaths = nullptr);
+
+        // Original O(B) Dijkstras-per-round implementation, kept for reference.
+        HRESULT CalMinPathBetweenBoundariesOriginal(
             VERTEX_ARRAY &allBoundaryList,
             std::vector<uint32_t> &boundaryRecord,
             uint32_t *pdwVertBoundaryID,

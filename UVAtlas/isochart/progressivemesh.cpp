@@ -13,6 +13,7 @@
 
 #include "pch.h"
 #include "progressivemesh.h"
+#include "uvatlas_timing.h"
 
 #define DOUBLE_OP(x, y, op) static_cast<double>(x) op static_cast<double>(y)
 
@@ -103,6 +104,7 @@ void CProgressiveMesh::Clear()
 HRESULT CProgressiveMesh::Initialize(CIsochartMesh &mesh)
 {
     HRESULT hr = S_OK;
+    UVATLAS_TIME_SCOPE_WORK("PM::Initialize", mesh.GetFaceNumber());
     Clear();
 
     m_dwVertNumber = static_cast<uint32_t>(mesh.GetVertexNumber());
@@ -147,6 +149,7 @@ HRESULT CProgressiveMesh::Initialize(CIsochartMesh &mesh)
 // See more detail in : [GH97]
 HRESULT CProgressiveMesh::Simplify()
 {
+    UVATLAS_TIME_SCOPE_WORK("PM::Simplify", m_dwVertNumber);
     uint32_t dwMinVertNumber = MIN_PM_VERT_NUMBER;
     float fMaxError = MAX_PM_ERROR;
 
